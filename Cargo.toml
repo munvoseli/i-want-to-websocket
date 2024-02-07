@@ -1,0 +1,16 @@
+[package]
+name = "ss"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio-tungstenite = { version = "0.20" }
+tungstenite = "0.20"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
