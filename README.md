@@ -1,4 +1,4 @@
-i regret that this is not finished.
+i regret that this is not finished.  it's unstable but you can use it if you want ig
 
 should you choose to accept it, there are bad instructions at the top of src/lib.rs
 
