@@ -15,6 +15,7 @@
 			f: WS sink, WS stream -> ()
 
  */
+//#![feature(trait_alias)]
 
 use hyper::Request;
 use hyper::Response;
@@ -29,7 +30,7 @@ use hyper::server::conn::http1::Builder;
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tokio::net::TcpStream;
+//use tokio::net::TcpStream;
 use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use tokio_tungstenite::WebSocketStream;
@@ -37,24 +38,32 @@ use futures::stream::SplitSink;
 //use std::pin::Pin;
 //use std::future::Future;
 
+//macro_rules! why {
+//	() => tokio::io::AsyncRead + tokio::io::AsyncWrite + futures_util::Sink<What>
+//}
+
+pub trait Why: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl Why for tokio::net::TcpStream {}
+
 
 pub struct WebSocketEventDriven {
 	pub message_handler: Box<dyn (Fn(Message) -> Option<Message>) + Send + Sync>,
 	pub quit_handler: Option<Box<dyn FnOnce() + Send + Sync>>,
 	pub req: Request<Incoming>,
 }
-pub struct WebSocketQueues {
-	pub callback: Box<dyn FnOnce(SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>, tokio::sync::mpsc::Receiver<Message>) + Send + Sync>,
+pub struct WebSocketQueues<S: Why> { // where S might be tokio::net::TcpStream
+	pub callback: Box<dyn FnOnce(SplitSink<WebSocketStream<S>, Message>, tokio::sync::mpsc::Receiver<Message>) + Send + Sync>,
 	pub req: Request<Incoming>,
 }
 
-pub enum Potato {
+pub enum Potato<S: Why> {
 	HTTPResponse(Response<Full<Bytes>>),
 	WebSocketHandler(WebSocketEventDriven),
-	WebSocketQueues(WebSocketQueues),
+	WebSocketQueues(WebSocketQueues<S>),
 }
 
-pub fn respond_file(s: &str) -> Potato {
+pub fn respond_file<S: Why>(s: &str) -> Potato<S> {
 	let maybefile = std::fs::File::open(format!("html/{}", s));
 	match maybefile {
 		Ok(mut file) => {
@@ -86,7 +95,7 @@ pub async fn serve_blocking<F, T, Fut>(
 //where F: core::future::Future + Send + 'static
 where F: (Fn(Request<Incoming>, T) -> Fut) + std::marker::Send + 'static + Clone + std::marker::Sync,
 T: Clone + Send + Sync + 'static,
-Fut: core::future::Future<Output = Potato> + Send
+Fut: core::future::Future<Output = Potato<tokio::net::TcpStream>> + Send,
 {
 	println!("making listener");
 	let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -99,52 +108,64 @@ Fut: core::future::Future<Output = Potato> + Send
 		let f = (&f).clone();
 		let t = data.clone();
 		tokio::task::spawn(async move {
-			let f = (&f).clone();
-			let t = t.clone();
-			let io = hyper_util::rt::TokioIo::new(stream);
-			if let Err(err) = Builder::new()
-			.serve_connection(io, service_fn(
-				|req: Request<hyper::body::Incoming>| async {
-					let f = (&f).clone();
-					let t = t.clone();
-					let retkey = {
-						let headers = req.headers();
-						let reqkey = headers.get("Sec-WebSocket-Key").clone();
-						if let Some(reqkey) = reqkey {
-							tungstenite::handshake::derive_accept_key(reqkey.as_bytes())
-						} else {
-							"".to_string()
-						}
-					};
-					match f(req, t).await {
-						Potato::HTTPResponse(r) => { return Ok::<_, hyper::http::Error>(r); },
-						Potato::WebSocketHandler(wsed) => { return handle_ws_eventdriven(wsed, retkey); },
-						Potato::WebSocketQueues(wsqf) => { return handle_ws_polldriven(wsqf, retkey); },
-					}
-				}
-			))
-			.with_upgrades()
-			.await
-			{
-				println!("Error serving connection: {:?}", err);
-			}
+			serve_blocking_generic_inner(stream, t, f).await;
 		});
 	}
 }
 
-fn handle_ws<F, Fut>(
+async fn serve_blocking_generic_inner<S, T, F, Fut>(
+	stream: S,
+	t: T,
+	f: F
+)
+where F: (Fn(Request<Incoming>, T) -> Fut) + std::marker::Send + 'static + Clone + std::marker::Sync,
+T: Clone + Send + Sync + 'static,
+Fut: core::future::Future<Output = Potato<S>> + Send,
+S: Why + 'static
+{
+	let io = hyper_util::rt::TokioIo::new(stream);
+	if let Err(err) = Builder::new()
+	.serve_connection(io, service_fn(
+		|req: Request<hyper::body::Incoming>| async {
+			let f = (&f).clone();
+			let t = t.clone();
+			let retkey = {
+				let headers = req.headers();
+				let reqkey = headers.get("Sec-WebSocket-Key").clone();
+				if let Some(reqkey) = reqkey {
+					tungstenite::handshake::derive_accept_key(reqkey.as_bytes())
+				} else {
+					"".to_string()
+				}
+			};
+			match f(req, t).await {
+				Potato::HTTPResponse(r) => { return Ok::<_, hyper::http::Error>(r); },
+				Potato::WebSocketHandler(wsed) => { return handle_ws_eventdriven::<S>(wsed, retkey); },
+				Potato::WebSocketQueues(wsqf) => { return handle_ws_polldriven(wsqf, retkey); },
+			}
+		}
+	))
+	.with_upgrades()
+	.await
+	{
+		println!("Error serving connection: {:?}", err);
+	}
+}
+
+fn handle_ws<F, Fut, S>(
 	mut req: Request<Incoming>,
 	retkey: String,
 	f: Box<F>
 )
 -> Result<Response<Full<Bytes>>, hyper::http::Error>
-where F: (FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut) + Send + 'static,
-Fut: core::future::Future<Output = ()> + Send
+where F: (FnOnce(tokio_tungstenite::WebSocketStream<S>) -> Fut) + Send + 'static,
+Fut: core::future::Future<Output = ()> + Send,
+S: Why + 'static
 {
 	tokio::task::spawn(async move {
 		match hyper::upgrade::on(&mut req).await {
 			Ok(upgraded) => {
-				let parts: hyper::upgrade::Parts<TokioIo<TcpStream>> = upgraded.downcast().unwrap();
+				let parts: hyper::upgrade::Parts<TokioIo<S>> = upgraded.downcast().unwrap();
 				let stream = parts.io.into_inner();
 				//let mut wsock = tokio_tungstenite::accept_async(stream).await.unwrap();
 				let wsock = tokio_tungstenite::WebSocketStream::from_raw_socket(
@@ -164,11 +185,12 @@ Fut: core::future::Future<Output = ()> + Send
 	.body(Full::new(Bytes::from("")))?);
 }
 
-fn handle_ws_polldriven(wsqf: WebSocketQueues, retkey: String)
+fn handle_ws_polldriven<S>(wsqf: WebSocketQueues<S>, retkey: String)
 -> Result<Response<Full<Bytes>>, hyper::http::Error>
+where S: Why + 'static
 {
 	let WebSocketQueues { callback, req } = wsqf;
-	handle_ws(req, retkey, Box::new(|wsock: WebSocketStream<tokio::net::TcpStream>| async move {
+	handle_ws(req, retkey, Box::new(|wsock: WebSocketStream<S>| async move {
 		let (sink, mut stream) = wsock.split();
 		let (sender, receiver) = tokio::sync::mpsc::channel(100);
 		tokio::spawn(async move {
@@ -185,11 +207,12 @@ fn handle_ws_polldriven(wsqf: WebSocketQueues, retkey: String)
 	}))
 }
 
-fn handle_ws_eventdriven(wsed: WebSocketEventDriven, retkey: String)
+fn handle_ws_eventdriven<S: Why + 'static>(wsed: WebSocketEventDriven, retkey: String)
 -> Result<Response<Full<Bytes>>, hyper::http::Error>
+where S: Why
 {
 	let WebSocketEventDriven { message_handler: fws, quit_handler: fquit, req } = wsed;
-	handle_ws(req, retkey, Box::new(|mut wsock: WebSocketStream<tokio::net::TcpStream>| async move {
+	handle_ws(req, retkey, Box::new(|mut wsock: WebSocketStream<S>| async move {
 		let fws = fws;
 		let fquit = fquit;
 		loop {
@@ -224,7 +247,7 @@ fn handle_ws_eventdriven(wsed: WebSocketEventDriven, retkey: String)
 good:
 	Box::new(|| async move {})
 		Box<F>
-		where F: (FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut) + Send + 'static,
+		where F: (FnOnce(tokio_tungstenite::WebSocketStream<S>) -> Fut) + Send + 'static,
 		Fut: core::future::Future<Output = ()>
 
 bad:
